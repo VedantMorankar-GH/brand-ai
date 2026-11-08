@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
+import { api } from '../data/api.js';
 import { addAuditEvent, getSubmissionComments } from '../data/reviewStore';
 import { getBrandReferenceData, getApprovedFacts, getTerminologyRules, readKnowledgeBase } from '../data/knowledgeBaseStore';
 import { scanBrandContent, extractPlainText } from '../data/brandScanner';
@@ -119,6 +120,8 @@ export default function CreatorWorkspacePage(){
  const persist=(next,options={})=>{
    const saved=saveCreatorDocument(next,readCreatorDocuments(),options);
    setDoc(saved);refreshDocs();setSaveState('Saved');
+   const payload={title:saved.title,content:saved.content,clientDocumentId:saved.id};
+   (saved.backendId?api(`/documents/${saved.backendId}`,{method:'PATCH',body:payload}):api('/documents',{method:'POST',body:payload})).then(remote=>{if(!saved.backendId){const linked={...saved,backendId:remote._id};saveCreatorDocument(linked,readCreatorDocuments());setDoc(current=>current?.id===linked.id?linked:current);refreshDocs();}}).catch(err=>console.error('Backend document sync failed:',err.message));
    return saved;
  };
  const notify=message=>{setToast(message);window.clearTimeout(notify.timer);notify.timer=window.setTimeout(()=>setToast(''),2600);};
@@ -154,6 +157,8 @@ export default function CreatorWorkspacePage(){
    const timer=window.setTimeout(()=>{
      const content=cleanHtml(editorRef.current?.innerHTML||doc.content);
      const saved=saveCreatorDocument({...doc,content},readCreatorDocuments());
+     const payload={title:saved.title,content:saved.content,clientDocumentId:saved.id};
+     (saved.backendId?api(`/documents/${saved.backendId}`,{method:'PATCH',body:payload}):api('/documents',{method:'POST',body:payload})).then(remote=>{if(!saved.backendId){const linked={...saved,backendId:remote._id};saveCreatorDocument(linked,readCreatorDocuments());setDoc(current=>current?.id===linked.id?linked:current);}}).catch(err=>console.error('Backend autosave failed:',err.message));
      addAuditEvent(user,'Document edited',saved,{version:saved.version,autosave:true});
      setDoc(saved);refreshDocs();setSaveState('Saved');
    },850);
@@ -198,32 +203,34 @@ export default function CreatorWorkspacePage(){
    setSaveState('Saving…');setDoc(current=>({...current,content,updatedAt:new Date().toISOString()}));
    if(scan){setScan(null);updateDoc({scanResults:null});}
  }
- function runScan(){
+ async function runScan(){
    if(!doc||scanning)return;
    const content=cleanHtml(editorRef.current?.innerHTML||doc.content||'');
    if(!extractPlainText(content).trim()){notify('Add document content before scanning.');return;}
-   const base=scanBrandContent(content);
-   const previous=scan?.issues||doc.scanResults?.issues||[];
-   const issues=base.issues.map(issue=>{
-     const old=previous.find(item=>item.ruleId===issue.ruleId&&item.snippet.toLowerCase()===issue.snippet.toLowerCase());
-     return old&&['Dismissed','Resolved'].includes(old.status)?{...issue,status:old.status,dismissalReason:old.dismissalReason,originalText:old.originalText,replacementApplied:old.replacementApplied}:issue;
-   });
-   const merged={...base,issues,score:scoreFor(issues),scannedAt:new Date().toISOString()};
-   setScanning(true);setProgress(0);setStageIndex(0);
-   let step=0;
-   scanTimer.current=window.setInterval(()=>{
-     step++;setStageIndex(Math.min(stages.length-1,step-1));setProgress(Math.min(100,Math.round(step/stages.length*100)));
-     if(step>=stages.length){
-       window.clearInterval(scanTimer.current);scanTimer.current=null;
-       const savedScan=saveScanResult(doc.id,merged,user);
-       addAuditEvent(user,'Scan performed',doc,{scanId:savedScan.id,issueCount:issues.length,score:merged.score});
-       const result={...merged,id:savedScan.id,scannedAt:savedScan.scannedAt};
-       setScan(result);setDoc(current=>({...current,content,scanResults:result}));setScanning(false);setSaveState('Saving…');
-       persist({...doc,content,scanResults:result});
-       notify(`Scan complete · ${issues.length} issue${issues.length===1?'':'s'} detected.`);
+   setScanning(true);setProgress(8);setStageIndex(0);
+   try{
+     let backendId=doc.backendId;
+     if(!backendId){
+       const created=await api('/documents',{method:'POST',body:{title:doc.title,content,clientDocumentId:doc.id}});
+       backendId=created._id;
+     }else{
+       await api(`/documents/${backendId}`,{method:'PATCH',body:{title:doc.title,content,clientDocumentId:doc.id}});
      }
-   },420);
+     const base=await api('/scan',{method:'POST',body:{content,documentId:backendId}});
+     const previous=scan?.issues||doc.scanResults?.issues||[];
+     const issues=(base.issues||[]).map(issue=>{const old=previous.find(item=>item.ruleId===issue.ruleId&&String(item.snippet||'').toLowerCase()===String(issue.snippet||'').toLowerCase());return old&&['Dismissed','Resolved'].includes(old.status)?{...issue,status:old.status,dismissalReason:old.dismissalReason,originalText:old.originalText,replacementApplied:old.replacementApplied}:issue;});
+     const merged={...base,issues,scannedAt:new Date().toISOString()};
+     setProgress(100);setStageIndex(stages.length-1);
+     const savedScan=saveScanResult(doc.id,merged,user);
+     addAuditEvent(user,'Scan performed',doc,{scanId:savedScan.id,issueCount:issues.length,score:merged.score});
+     const result={...merged,id:savedScan.id,scannedAt:savedScan.scannedAt};
+     setScan(result);setDoc(current=>({...current,content,scanResults:result}));setSaveState('Saving…');
+     persist({...doc,backendId,content,scanResults:result});
+     notify(`AI scan complete · ${issues.length} issue${issues.length===1?'':'s'} detected.`);
+   }catch(error){notify(error.message||'Could not connect to the BrandGuard API.');}
+   finally{setScanning(false);setProgress(0);setStageIndex(0);}
  }
+
  function replaceSnippet(issue,replacement){
    const root=editorRef.current;if(!root||!issue.snippet)return false;
    const walker=document.createTreeWalker(root,NodeFilter.SHOW_TEXT);let node;
@@ -321,15 +328,21 @@ export default function CreatorWorkspacePage(){
    document.body.appendChild(anchor);anchor.click();anchor.remove();URL.revokeObjectURL(url);notify('Markdown document downloaded.');
  }
  function submitOpen(){saveNow(false);setModal({type:'submit'});}
- function submitForReview(){
+ async function submitForReview(){
    const currentScan=scan;
    if(!extractPlainText(cleanHtml(editorRef.current?.innerHTML||doc.content||'')).trim()){notify('Add document content before submitting.');return;}
-   const openCritical=(currentScan?.issues||[]).filter(i=>i.severity==='Critical'&&i.status!=='Resolved');
-   if(openCritical.length){notify(`${openCritical.length} unresolved Critical issue(s) block submission.`);return;}
    if(!currentScan){notify('Run a scan before submitting for review.');return;}
    const content=cleanHtml(editorRef.current?.innerHTML||doc.content||'');
-   const checkpoint=saveCreatorDocument({...doc,content,lastCheckpointContent:content,lastCheckpointTitle:doc.title,lastCheckpointAt:new Date().toISOString(),lastCheckpointScanResults:currentScan},readCreatorDocuments(),{newVersion:true});
-   const submission=submitCreatorDocument(checkpoint,user,currentScan);
+   let backendId=doc.backendId;
+   let serverScan;
+   try{
+     if(!backendId){const remote=await api('/documents',{method:'POST',body:{title:doc.title,content,clientDocumentId:doc.id}});backendId=remote._id;}
+     else await api(`/documents/${backendId}`,{method:'PATCH',body:{title:doc.title,content,clientDocumentId:doc.id}});
+     serverScan=await api('/scan',{method:'POST',body:{content,documentId:backendId}});
+     await api(`/documents/${backendId}/submit`,{method:'POST'});
+   }catch(error){notify(`Could not submit to the server: ${error.message}`);return;}
+   const checkpoint=saveCreatorDocument({...doc,backendId,content,lastCheckpointContent:content,lastCheckpointTitle:doc.title,lastCheckpointAt:new Date().toISOString(),lastCheckpointScanResults:serverScan},readCreatorDocuments(),{newVersion:true});
+   const submission=submitCreatorDocument(checkpoint,user,serverScan);
    const next=appendDocumentActivity({...checkpoint,status:'In Review',submissionId:submission.id,submittedAt:submission.submittedAt},'Submitted for review','submitted');
    persist(next);addAuditEvent(user,submission.previousSubmissionId?'Document resubmitted':'Document submitted',next,{version:submission.version,submissionId:submission.id,previousSubmissionId:submission.previousSubmissionId||null},submission.id);setModal(null);notify('Submitted to the Reviewer Queue.');
  }
@@ -370,7 +383,7 @@ export default function CreatorWorkspacePage(){
    <aside className={`cw-issues-column ${rightOpen?'':'collapsed'}`}>
     <div className="cw-panel-header"><div><span className="cw-panel-kicker">BRANDGUARD SCANNER</span><h3>Compliance review</h3><p>Rule-based checks against your approved brand knowledge.</p></div><button title={rightOpen?'Collapse panel':'Expand panel'} onClick={()=>setRightOpen(!rightOpen)}>{rightOpen?<PanelRightClose size={17}/>:<PanelRightOpen size={17}/>}</button></div>
     {rightOpen&&<>
-      {scanning?<div className="cw-scanning-card"><ScanVisual stage={stages[stageIndex]} progress={progress}/><div className="cw-stage-list">{stages.map((stage,i)=><div key={stage} className={i<stageIndex?'done':i===stageIndex?'current':''}>{i<stageIndex?<CheckCircle2 size={14}/>:i===stageIndex?<LoaderCircle size={14} className="spin"/>:<span/>}{stage}</div>)}</div><div className="cw-simulation-note"><Zap size={13}/> Frontend simulation · No AI API connected</div></div>:scan?<><div className="cw-score-card"><div><span>COMPLIANCE SCORE</span><h2>{scoreFor(scan.issues)}<small>/100</small></h2><p>{unresolved.length?`${unresolved.length} open issues need attention`:'No unresolved issues detected'}</p></div><ScoreRing score={scoreFor(scan.issues)}/></div><div className="cw-severity-grid">{severityCounts.map(item=><div key={item.severity}><span className={`cw-sev-dot ${item.severity.toLowerCase()}`}/><b>{item.count}</b><small>{item.severity}</small></div>)}</div><div className="cw-panel-toolbar"><b>Detected issues <span>{scan.issues.length}</span></b><select value={issueFilter} onChange={e=>setIssueFilter(e.target.value)}><option>All</option><option>Critical</option><option>Major</option><option>Minor</option><option>Informational</option><option>Resolved</option><option>Dismissed</option><option>Open</option><option>Unresolved</option></select></div><div className="cw-category-breakdown">{(scan.categoryBreakdown||[]).filter(item=>item.count>0).map(item=><div key={item.category}><span>{item.category}</span><b>{item.count}</b><i style={{width:`${Math.max(6,item.count/Math.max(1,scan.issues.length)*100)}%`}}/></div>)}</div><div className="cw-evidence-breakdown">{(scan.evidenceBreakdown||[]).map(item=><span key={item.classification}><b>{item.count}</b>{item.classification}</span>)}</div><div className="cw-issue-search"><Search size={14}/><input value={issueSearch} onChange={e=>setIssueSearch(e.target.value)} placeholder="Search issues…"/></div><div className="cw-issue-list">{visibleIssues.map(issue=><IssueCard key={issue.id} issue={issue} active={activeIssue===issue.id} onSelect={selectIssue} onAccept={acceptSuggestion} onEdit={editSuggestion} onDismiss={dismissIssue} onRestore={restoreOriginal}/>)}{!visibleIssues.length&&<div className="cw-empty"><CheckCircle2 size={22}/><b>No matching issues</b><span>Change the filter or search term.</span></div>}</div><div className="cw-scan-foot"><span>Last scan {fmt(scan.scannedAt)}</span><button onClick={runScan}><RotateCcw size={13}/> Re-scan</button></div></>:<div className="cw-no-scan"><div className="cw-no-scan-icon"><ScanLine size={25}/></div><h4>Ready to review your content</h4><p>Run a scan to compare this document with approved facts, terminology and deterministic accessibility checks from your Brand Knowledge Base.</p><button className="cw-btn primary" onClick={runScan}><ScanLine size={15}/> Scan document</button><div className="cw-checklist"><span><Check size={13}/> Approved terminology</span><span><Check size={13}/> Verified facts</span><span><Check size={13}/> Claims and accessibility</span></div><small>Frontend simulation · No model/API connected</small></div>}
+      {scanning?<div className="cw-scanning-card"><ScanVisual stage={stages[stageIndex]} progress={progress}/><div className="cw-stage-list">{stages.map((stage,i)=><div key={stage} className={i<stageIndex?'done':i===stageIndex?'current':''}>{i<stageIndex?<CheckCircle2 size={14}/>:i===stageIndex?<LoaderCircle size={14} className="spin"/>:<span/>}{stage}</div>)}</div><div className="cw-simulation-note"><Zap size={13}/> Server-side AI analysis</div></div>:scan?<><div className="cw-score-card"><div><span>COMPLIANCE SCORE</span><h2>{scoreFor(scan.issues)}<small>/100</small></h2><p>{unresolved.length?`${unresolved.length} open issues need attention`:'No unresolved issues detected'}</p></div><ScoreRing score={scoreFor(scan.issues)}/></div><div className="cw-severity-grid">{severityCounts.map(item=><div key={item.severity}><span className={`cw-sev-dot ${item.severity.toLowerCase()}`}/><b>{item.count}</b><small>{item.severity}</small></div>)}</div><div className="cw-panel-toolbar"><b>Detected issues <span>{scan.issues.length}</span></b><select value={issueFilter} onChange={e=>setIssueFilter(e.target.value)}><option>All</option><option>Critical</option><option>Major</option><option>Minor</option><option>Informational</option><option>Resolved</option><option>Dismissed</option><option>Open</option><option>Unresolved</option></select></div><div className="cw-category-breakdown">{(scan.categoryBreakdown||[]).filter(item=>item.count>0).map(item=><div key={item.category}><span>{item.category}</span><b>{item.count}</b><i style={{width:`${Math.max(6,item.count/Math.max(1,scan.issues.length)*100)}%`}}/></div>)}</div><div className="cw-evidence-breakdown">{(scan.evidenceBreakdown||[]).map(item=><span key={item.classification}><b>{item.count}</b>{item.classification}</span>)}</div><div className="cw-issue-search"><Search size={14}/><input value={issueSearch} onChange={e=>setIssueSearch(e.target.value)} placeholder="Search issues…"/></div><div className="cw-issue-list">{visibleIssues.map(issue=><IssueCard key={issue.id} issue={issue} active={activeIssue===issue.id} onSelect={selectIssue} onAccept={acceptSuggestion} onEdit={editSuggestion} onDismiss={dismissIssue} onRestore={restoreOriginal}/>)}{!visibleIssues.length&&<div className="cw-empty"><CheckCircle2 size={22}/><b>No matching issues</b><span>Change the filter or search term.</span></div>}</div><div className="cw-scan-foot"><span>Last scan {fmt(scan.scannedAt)}</span><button onClick={runScan}><RotateCcw size={13}/> Re-scan</button></div></>:<div className="cw-no-scan"><div className="cw-no-scan-icon"><ScanLine size={25}/></div><h4>Ready to review your content</h4><p>Run a scan to compare this document with the active brand rules configured in your workspace.</p><button className="cw-btn primary" onClick={runScan}><ScanLine size={15}/> Scan document</button><div className="cw-checklist"><span><Check size={13}/> Approved terminology</span><span><Check size={13}/> Verified facts</span><span><Check size={13}/> Claims and accessibility</span></div><small>Server-side AI analysis · Human review recommended</small></div>}
     </>}
    </aside>
   </div>
@@ -378,7 +391,7 @@ export default function CreatorWorkspacePage(){
 
   <AnimatePresence>{modal?.type==='edit-suggestion'&&<Modal title="Edit suggested correction" onClose={()=>setModal(null)}><div className="cw-modal-copy"><small>ORIGINAL TEXT</small><blockquote>{modal.issue.snippet}</blockquote><label>Suggested replacement<textarea rows="4" value={suggestionText} onChange={e=>setSuggestionText(e.target.value)}/></label><div className="cw-modal-actions"><button className="cw-btn secondary" onClick={()=>setModal(null)}>Cancel</button><button className="cw-btn primary" onClick={()=>{acceptSuggestion(modal.issue,suggestionText);setModal(null);}}>Apply edited correction</button></div></div></Modal>}</AnimatePresence>
   <AnimatePresence>{modal?.type==='dismiss'&&<Modal title="Dismiss issue" onClose={()=>setModal(null)}><div className="cw-modal-copy"><Pill tone={modal.issue.severity==='Critical'?'critical':'neutral'}>{modal.issue.severity}</Pill><p>Dismiss “{modal.issue.title}” without changing the document text.</p><label>Reason {modal.issue.severity==='Critical'&&<b className="required">Required for Critical issues</b>}<textarea rows="3" value={dismissReason} onChange={e=>setDismissReason(e.target.value)} placeholder="Explain why this issue does not require a change…"/></label><div className="cw-modal-actions"><button className="cw-btn secondary" onClick={()=>setModal(null)}>Cancel</button><button className="cw-btn primary" onClick={confirmDismiss}>Record dismissal</button></div></div></Modal>}</AnimatePresence>
-  <AnimatePresence>{modal?.type==='submit'&&<Modal title="Pre-submission review" onClose={()=>setModal(null)} wide><div className="cw-modal-copy"><div className="cw-submission-title"><div><small>DOCUMENT</small><h4>{doc.title}</h4><span>Version {doc.version} · {doc.status}</span></div><Pill tone="blue">Frontend simulation</Pill></div><Summary scan={scan}/>{!extractPlainText(doc.content||'').trim()&&<div className="cw-submit-warning"><AlertTriangle size={16}/> Add document content before submitting.</div>}{!scan&&<div className="cw-submit-warning"><AlertTriangle size={16}/> Run a document scan before submitting.</div>}{critical.length>0&&<div className="cw-submit-warning"><ShieldAlert size={17}/><span><b>Submission blocked</b><small>{critical.length} unresolved Critical issue(s) must be resolved. Reviewer/legal override is not implemented in this part.</small></span></div>}{scan&&critical.length===0&&<div className="cw-submit-success"><CheckCircle2 size={16}/> No unresolved Critical issues. This document can be submitted for review.</div>}<div className="cw-ai-disclosure"><CircleHelp size={15}/><span>AI-use disclosure: this scan is a deterministic frontend simulation using local rules and Part 2 knowledge-base data. It is not a connected AI model, legal opinion or validated accuracy measure.</span></div><div className="cw-modal-actions"><button className="cw-btn secondary" onClick={()=>setModal(null)}>Back to editor</button><button className="cw-btn secondary" onClick={()=>{saveNow();setModal(null);}}>Save draft</button><button className="cw-btn primary" disabled={!scan||critical.length>0||!extractPlainText(doc.content||'').trim()} onClick={submitForReview}><Send size={14}/> Submit for review</button></div></div></Modal>}</AnimatePresence>
+  <AnimatePresence>{modal?.type==='submit'&&<Modal title="Pre-submission review" onClose={()=>setModal(null)} wide><div className="cw-modal-copy"><div className="cw-submission-title"><div><small>DOCUMENT</small><h4>{doc.title}</h4><span>Version {doc.version} · {doc.status}</span></div><Pill tone="blue">Server-backed submission</Pill></div><Summary scan={scan}/>{!extractPlainText(doc.content||'').trim()&&<div className="cw-submit-warning"><AlertTriangle size={16}/> Add document content before submitting.</div>}{!scan&&<div className="cw-submit-warning"><AlertTriangle size={16}/> Run a document scan before submitting.</div>}{critical.length>0&&<div className="cw-submit-warning"><ShieldAlert size={17}/><span><b>Submission blocked</b><small>{critical.length} unresolved Critical issue(s) must be resolved. Reviewer/legal override is not implemented in this part.</small></span></div>}{scan&&critical.length===0&&<div className="cw-submit-success"><CheckCircle2 size={16}/> No unresolved Critical issues. This document can be submitted for review.</div>}<div className="cw-ai-disclosure"><CircleHelp size={15}/><span>AI-use disclosure: this scan is generated by the configured server-side AI model using active brand rules stored in the workspace database. AI findings require human review.</span></div><div className="cw-modal-actions"><button className="cw-btn secondary" onClick={()=>setModal(null)}>Back to editor</button><button className="cw-btn secondary" onClick={()=>{saveNow();setModal(null);}}>Save draft</button><button className="cw-btn primary" disabled={!scan||critical.length>0||!extractPlainText(doc.content||'').trim()} onClick={submitForReview}><Send size={14}/> Submit for review</button></div></div></Modal>}</AnimatePresence>
   <AnimatePresence>{modal?.type==='history'&&<Modal title="Document version history" onClose={()=>setModal(null)} wide><div className="cw-history-list"><div className="cw-history-row"><span className="current">V{doc.version||1}</span><div><b>Current version</b><small>{fmt(doc.updatedAt)} · {doc.status}</small><p>{doc.title}</p></div><Pill tone="blue">Current</Pill></div>{(doc.versions||[]).slice().reverse().map(v=><div className="cw-history-row" key={`${v.version}-${v.savedAt}`}><span>V{v.version}</span><div><b>Saved snapshot</b><small>{fmt(v.savedAt)} · {v.status}</small><p>{v.title}</p><button onClick={()=>{if(!window.confirm(`Restore version ${v.version}? Current content will be saved as a new version.`))return;const restored=persist({...doc,title:v.title,content:v.content,status:v.status,scanResults:v.scanResults,lastCheckpointContent:v.content,lastCheckpointTitle:v.title,lastCheckpointAt:new Date().toISOString(),lastCheckpointScanResults:v.scanResults},{newVersion:true});if(editorRef.current)editorRef.current.innerHTML=restored.content;setScan(restored.scanResults);setModal(null);notify(`Version ${v.version} restored.`);}}>Restore this version</button></div></div>)}</div></Modal>}</AnimatePresence>
   <AnimatePresence>{modal?.type==='activity'&&<Modal title="Document activity" onClose={()=>setModal(null)}><div className="cw-activity-list">{(doc.activity||[]).map(item=><div key={item.id}><span><Activity size={13}/></span><div><b>{item.label}</b><small>{fmt(item.at)} · {item.type}</small></div></div>)}</div></Modal>}</AnimatePresence>
   <AnimatePresence>{modal?.type==='actions'&&<Modal title="Document actions" onClose={()=>setModal(null)}><div className="cw-action-menu"><button onClick={()=>{setModal(null);duplicate();}}><Copy size={16}/> Duplicate document</button><button onClick={()=>{setModal(null);setModal({type:'history'});}}><FileClock size={16}/> View version history</button><button onClick={()=>setModal({type:'activity'})}><Activity size={16}/> View document activity</button><button onClick={()=>{setModal(null);saveNow();}}><Save size={16}/> Save draft</button><button onClick={()=>{setModal(null);downloadDocument();}}><Download size={16}/> Download Markdown</button><button className="danger" onClick={()=>{setModal(null);deleteCurrent();}}><Trash2 size={16}/> Delete document</button></div></Modal>}</AnimatePresence>
